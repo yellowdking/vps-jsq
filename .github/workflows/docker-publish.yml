@@ -1,0 +1,186 @@
+name: Build, Test and Publish Docker Image
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run unit tests
+        run: npm test
+
+      - name: Build production assets
+        run: npm run build
+
+      - name: Package dist archive
+        run: |
+          test -f dist/index.html
+          tar -czf vps-jsq-dist.tar.gz -C dist .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vps-jsq-dist
+          path: vps-jsq-dist.tar.gz
+          retention-days: 7
+
+  docker:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Smoke test Docker container on port 3000
+        run: |
+          docker build -t vps-jsq:smoke .
+          docker run -d --name vps-jsq-smoke -p 3000:3000 vps-jsq:smoke
+          trap 'docker logs vps-jsq-smoke || true; docker rm -f vps-jsq-smoke || true' EXIT
+          for i in $(seq 1 20); do
+            if curl -fsS http://127.0.0.1:3000/healthz | grep -q "^ok$"; then
+              break
+            fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:3000/healthz | grep -q "^ok$"
+          curl -fsSI http://127.0.0.1:3000/ | grep -iq "x-content-type-options: nosniff"
+          curl -fsS http://127.0.0.1:3000/ | grep -q "VPS 剩余价值"
+
+      - name: Login to GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract GHCR metadata
+        if: github.event_name != 'pull_request'
+        id: ghcr_meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push multi-arch image to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.ghcr_meta.outputs.tags }}
+          labels: ${{ steps.ghcr_meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Check Docker Hub credentials
+        if: github.event_name != 'pull_request'
+        id: dockerhub_check
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Login to Docker Hub
+        if: github.event_name != 'pull_request' && steps.dockerhub_check.outputs.enabled == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract Docker Hub metadata
+        if: github.event_name != 'pull_request' && steps.dockerhub_check.outputs.enabled == 'true'
+        id: dockerhub_meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ secrets.DOCKERHUB_USERNAME }}/vps-jsq
+          tags: |
+            type=semver,pattern={{version}}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push multi-arch image to Docker Hub
+        if: github.event_name != 'pull_request' && steps.dockerhub_check.outputs.enabled == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.dockerhub_meta.outputs.tags }}
+          labels: ${{ steps.dockerhub_meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  release:
+    needs: [test, docker]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: vps-jsq-dist
+
+      - name: Create GitHub Release when version tag is new
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          TAG="v${VERSION}"
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG already exists, skipping release creation."
+            exit 0
+          fi
+          {
+            echo "## vps-jsq ${TAG}"
+            cat <<'EOF'
+
+          ### Docker 一键运行（端口 3000）
+          ```bash
+          docker run -d --name vps-jsq -p 3000:3000 --restart unless-stopped bbplin/vps-jsq:latest
+          ```
+
+          ### 核心更新
+          - 全面切换至非 root 轻量级 Docker 部署（`nginxinc/nginx-unprivileged:1.27-alpine`），统一监听 `3000` 端口，内置 `/healthz` 健康检查、Gzip 压缩与静态资源强缓存
+          - 支持多架构镜像（`linux/amd64` / `linux/arm64`），提供 `docker-compose.yml` 与 GitHub Actions CI/CD 自动化测试构建
+          - 重构核心计算模块（UTC 精确日期计算、防负数钳位、日均成本与到期状态标识）并新增单元测试
+          - 汇率全币种缓存 + 多源自动容错与离线兜底，保留用户自定义汇率不被刷新覆盖
+          - 支持 URL 参数分享链接、一键重置、交易卡片 PNG 一键下载/复制以及 HTTP 环境兼容剪贴板复制
+          EOF
+          } > release-notes.md
+          gh release create "$TAG" vps-jsq-dist.tar.gz \
+            --target "$GITHUB_SHA" \
+            --title "VPS 剩余价值计算器 ${TAG}" \
+            --notes-file release-notes.md

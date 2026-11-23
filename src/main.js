@@ -1,13 +1,64 @@
-﻿import './style.css';
+import './style.css';
+import {
+    CURRENCY_SYMBOLS,
+    DEFAULT_FALLBACK_RATES,
+    formatDateISO,
+    addDaysISO,
+    formatDateDisplay,
+    calculateRemainingValue,
+    buildMarkdownSummary,
+    parseShareParams,
+    buildShareQuery
+} from './calculator.js';
 
-const API_URL = 'https://open.er-api.com/v6/latest/CNY';
+const RATE_SOURCES = [
+    {
+        name: 'ExchangeRate-API',
+        url: 'https://open.er-api.com/v6/latest/CNY',
+        parse: (data) => {
+            if (data?.result !== 'success' || !data.rates) return null;
+            const cnyPerUnit = {};
+            for (const code of Object.keys(CURRENCY_SYMBOLS)) {
+                if (code === 'CNY') {
+                    cnyPerUnit.CNY = 1;
+                } else if (data.rates[code] > 0) {
+                    cnyPerUnit[code] = 1 / data.rates[code];
+                }
+            }
+            return Object.keys(cnyPerUnit).length > 1 ? cnyPerUnit : null;
+        }
+    },
+    {
+        name: 'Currency-API',
+        url: 'https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/cny.json',
+        parse: (data) => {
+            const rates = data?.cny;
+            if (!rates) return null;
+            const cnyPerUnit = {};
+            for (const code of Object.keys(CURRENCY_SYMBOLS)) {
+                if (code === 'CNY') {
+                    cnyPerUnit.CNY = 1;
+                } else {
+                    const v = rates[code.toLowerCase()];
+                    if (v > 0) cnyPerUnit[code] = 1 / v;
+                }
+            }
+            return Object.keys(cnyPerUnit).length > 1 ? cnyPerUnit : null;
+        }
+    }
+];
+
+const RATES_CACHE_KEY = 'vps_rates_all_v2';
+const INPUTS_CACHE_KEY = 'vps_inputs';
+const REFRESH_LIMIT_KEY = 'vps_refresh_limit';
+const FETCH_TIMEOUT_MS = 8000;
+
 let htmlToImageModulePromise = null;
-
-const currencySymbols = {
-    'USD': '$', 'EUR': '\u20AC', 'GBP': '\u00A3', 'JPY': '\u00A5',
-    'CNY': '\u00A5', 'HKD': 'HK$', 'AUD': 'A$', 'SGD': 'S$',
-    'KRW': '\u20A9', 'TWD': 'NT$', 'CAD': 'C$'
-};
+let rateLimitTimer = null;
+let toastTimer = null;
+let hasCustomRateOverride = false;
+let latestGeneratedDataUrl = '';
+let latestResult = null;
 
 const els = {
     price: document.getElementById('price'),
@@ -21,72 +72,122 @@ const els = {
     apiRateDisplay: document.getElementById('apiRateDisplay'),
     refreshBtn: document.getElementById('refreshRateBtn'),
     refreshIcon: document.getElementById('refreshIcon'),
+    resetBtn: document.getElementById('resetBtn'),
+    shareLinkBtn: document.getElementById('shareLinkBtn'),
     symbolDisplay: document.querySelector('.symbol-display'),
     finalValue: document.getElementById('finalValue'),
     originalCurrencyValue: document.getElementById('originalCurrencyValue'),
+    dailyCostPreview: document.getElementById('dailyCostPreview'),
+    expiredBadge: document.getElementById('expiredBadge'),
     daysRemaining: document.getElementById('daysRemaining'),
     progressBar: document.getElementById('progressBar'),
     progressText: document.getElementById('progressText'),
     priceCNYPreview: document.getElementById('priceCNYPreview'),
     toast: document.getElementById('toast'),
     rateLimitTip: document.getElementById('rateLimitTip'),
+    closeRateLimitBtn: document.getElementById('closeRateLimitBtn'),
     themeToggle: document.getElementById('themeToggle'),
-    themeToggleKnob: document.getElementById('themeToggleKnob')
+    themeToggleKnob: document.getElementById('themeToggleKnob'),
+    copyBtn: document.getElementById('copyBtn'),
+    imgBtn: document.getElementById('imgBtn'),
+    modalEl: document.getElementById('imageModal'),
+    modalCloseBtn: document.getElementById('closeModalBtn'),
+    modalImg: document.getElementById('generatedImage'),
+    modalLoading: document.getElementById('modalLoading'),
+    modalActions: document.getElementById('modalActions'),
+    downloadImgBtn: document.getElementById('downloadImgBtn'),
+    copyImgBtn: document.getElementById('copyImgBtn')
 };
-
-let rateLimitTimer = null;
 
 window.addEventListener('DOMContentLoaded', () => {
     initTheme();
-    loadInputsFromCookie(); 
-    initDates(); 
-    initRates(); 
+    loadInputs();
+    initDates();
+    initRates({ preserveCustomRate: hasCustomRateOverride });
     setupEventListeners();
-    calculate(); 
+    calculate();
 });
 
 function setupEventListeners() {
-    const debouncedSave = debounce(saveInputsToCookie, 500);
+    const debouncedSave = debounce(saveInputs, 400);
 
-    [els.price, els.dueDate, els.tradeDate, els.customRate].forEach(el => el.addEventListener('input', () => {
-        syncDateDisplays();
+    els.price.addEventListener('input', () => {
+        if (Number(els.price.value) < 0) els.price.value = '0';
         calculate();
         debouncedSave();
-    }));
-
-    [els.dueDate, els.tradeDate].forEach(el => el.addEventListener('change', () => {
-        syncDateDisplays();
-        calculate();
-        saveInputsToCookie();
-    }));
-    
-    els.cycles.forEach(radio => radio.addEventListener('change', () => {
-        calculate();
-        saveInputsToCookie();
-    }));
-
-    els.currency.addEventListener('change', () => {
-        updateCurrencySymbol();
-        initRates(); 
-        syncDateDisplays();
-        calculate();
-        saveInputsToCookie();
     });
 
-    els.refreshBtn.addEventListener('click', manualRefreshRate); 
+    els.customRate.addEventListener('input', () => {
+        if (Number(els.customRate.value) < 0) els.customRate.value = '0';
+        hasCustomRateOverride = els.customRate.value.trim() !== '';
+        calculate();
+        debouncedSave();
+    });
+
+    [els.dueDate, els.tradeDate].forEach((el) => {
+        el.addEventListener('input', () => {
+            syncDateDisplays();
+            calculate();
+            debouncedSave();
+        });
+        el.addEventListener('change', () => {
+            syncDateDisplays();
+            calculate();
+            saveInputs();
+        });
+    });
+
+    els.cycles.forEach((radio) => {
+        radio.addEventListener('change', () => {
+            calculate();
+            saveInputs();
+        });
+    });
+
+    els.currency.addEventListener('change', () => {
+        hasCustomRateOverride = false;
+        updateCurrencySymbol();
+        initRates({ preserveCustomRate: false });
+        syncDateDisplays();
+        calculate();
+        saveInputs();
+    });
+
+    els.refreshBtn.addEventListener('click', () => manualRefreshRate(true));
     els.themeToggle.addEventListener('click', toggleTheme);
+    els.copyBtn.addEventListener('click', copyResult);
+    els.imgBtn.addEventListener('click', generateImage);
+    els.resetBtn?.addEventListener('click', resetCalculator);
+    els.shareLinkBtn?.addEventListener('click', copyShareLink);
+    els.closeRateLimitBtn?.addEventListener('click', hideRateLimitTip);
+    els.modalCloseBtn?.addEventListener('click', closeImageModal);
+    els.downloadImgBtn?.addEventListener('click', downloadGeneratedImage);
+    els.copyImgBtn?.addEventListener('click', copyGeneratedImage);
+
+    els.modalEl.addEventListener('click', (e) => {
+        if (e.target === els.modalEl) closeImageModal();
+    });
+
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && !els.modalEl.classList.contains('hidden')) {
+            closeImageModal();
+        }
+    });
 }
 
 function debounce(func, wait) {
     let timeout;
-    return function(...args) {
+    return function (...args) {
         clearTimeout(timeout);
         timeout = setTimeout(() => func.apply(this, args), wait);
     };
 }
 
 function initTheme() {
-    if (localStorage.theme === 'dark' || (!('theme' in localStorage) && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
+    if (
+        localStorage.theme === 'dark' ||
+        (!('theme' in localStorage) && window.matchMedia('(prefers-color-scheme: dark)').matches)
+    ) {
         document.documentElement.classList.add('dark');
         updateToggleUI(true);
     } else {
@@ -111,55 +212,52 @@ function updateToggleUI(isDark) {
     }
 }
 
-function setCookie(name, value, hours) {
-    const expiresAt = Date.now() + (hours * 60 * 60 * 1000);
-    localStorage.setItem(name, JSON.stringify({ value, expiresAt }));
+function setStorageWithTTL(name, value, hours) {
+    try {
+        const expiresAt = Date.now() + hours * 60 * 60 * 1000;
+        localStorage.setItem(name, JSON.stringify({ value, expiresAt }));
+    } catch (e) {
+        console.warn('Storage write skipped:', e);
+    }
 }
 
-function getCookie(name) {
-    const stored = localStorage.getItem(name);
-    if (stored) {
-        try {
+function getStorageWithTTL(name) {
+    try {
+        const stored = localStorage.getItem(name);
+        if (stored) {
             const parsed = JSON.parse(stored);
             if (!parsed.expiresAt || parsed.expiresAt > Date.now()) {
-                return parsed.value || "";
+                return parsed.value || '';
             }
             localStorage.removeItem(name);
-        } catch (e) {
-            localStorage.removeItem(name);
         }
+    } catch (e) {
+        localStorage.removeItem(name);
     }
 
-    const cname = name + "=";
-    const decodedCookie = decodeURIComponent(document.cookie);
+    // Legacy cookie fallback for existing users
+    const cname = `${name}=`;
+    const decodedCookie = decodeURIComponent(document.cookie || '');
     const ca = decodedCookie.split(';');
-    for(let i = 0; i <ca.length; i++) {
-        let c = ca[i];
-        while (c.charAt(0) == ' ') {
-            c = c.substring(1);
-        }
-        if (c.indexOf(cname) == 0) {
-            return c.substring(cname.length, c.length);
+    for (let i = 0; i < ca.length; i++) {
+        let c = ca[i].trim();
+        if (c.indexOf(cname) === 0) {
+            return c.substring(cname.length);
         }
     }
-    return "";
+    return '';
 }
 
 async function getHtmlToImage() {
     if (!htmlToImageModulePromise) {
         htmlToImageModulePromise = import('html-to-image');
     }
-
     return htmlToImageModulePromise;
 }
 
-function formatDateForDisplay(value) {
-    return value ? value.replace(/-/g, '/') : '--/--/--';
-}
-
 function syncDateDisplays() {
-    els.dueDateDisplay.textContent = formatDateForDisplay(els.dueDate.value);
-    els.tradeDateDisplay.textContent = formatDateForDisplay(els.tradeDate.value);
+    els.dueDateDisplay.textContent = formatDateDisplay(els.dueDate.value);
+    els.tradeDateDisplay.textContent = formatDateDisplay(els.tradeDate.value);
 }
 
 function prepareDateInputsForExport(node) {
@@ -168,7 +266,6 @@ function prepareDateInputsForExport(node) {
 
     nativeInputs.forEach((input) => {
         input.style.display = 'none';
-
         restoreTasks.push(() => {
             input.style.display = '';
         });
@@ -179,123 +276,208 @@ function prepareDateInputsForExport(node) {
     };
 }
 
-function saveInputsToCookie() {
+function getSelectedCycle() {
+    for (const radio of els.cycles) {
+        if (radio.checked) {
+            return {
+                days: parseInt(radio.value, 10),
+                label: radio.parentElement.innerText.trim()
+            };
+        }
+    }
+    return { days: 365, label: '年付' };
+}
+
+function saveInputs() {
     const data = {
         price: els.price.value,
         currency: els.currency.value,
-        cycle: Array.from(els.cycles).find(r => r.checked)?.value || "365",
+        cycle: String(getSelectedCycle().days),
         dueDate: els.dueDate.value,
-        customRate: els.customRate.value
+        customRate: els.customRate.value,
+        customRateOverride: hasCustomRateOverride
     };
-    setCookie("vps_inputs", JSON.stringify(data), 0.5);
+    setStorageWithTTL(INPUTS_CACHE_KEY, JSON.stringify(data), 24);
 }
 
-function loadInputsFromCookie() {
-    const saved = getCookie("vps_inputs");
-    if (saved) {
-        try {
-            const data = JSON.parse(saved);
-            if(data.price) els.price.value = data.price;
-            if(data.currency) els.currency.value = data.currency;
-            if(data.dueDate) els.dueDate.value = data.dueDate;
-            if(data.customRate) els.customRate.value = data.customRate;
-            if(data.cycle) {
-                const radio = document.querySelector(`input[name="cycle"][value="${data.cycle}"]`);
-                if(radio) radio.checked = true;
-            }
-            updateCurrencySymbol();
-        } catch(e) { console.error("Cookie parse error", e); }
-    }
-}
-
-async function initRates() {
-    const base = els.currency.value;
-    if (base === 'CNY') {
-        finishRateUpdate(1, "1.0000");
+function loadInputs() {
+    const urlParams = parseShareParams(window.location.search);
+    if (urlParams) {
+        applyInputData({
+            ...urlParams,
+            customRateOverride: Boolean(urlParams.customRate)
+        });
         return;
     }
 
-    const cacheKey = `vps_rate_${base}`;
-    const cachedData = getCookie(cacheKey);
-
-    if (cachedData) {
+    const saved = getStorageWithTTL(INPUTS_CACHE_KEY);
+    if (saved) {
         try {
-            const data = JSON.parse(cachedData);
-            finishRateUpdate(data.rate, data.rate.toFixed(4));
+            const data = JSON.parse(saved);
+            applyInputData(data);
         } catch (e) {
-            manualRefreshRate(false);
+            console.error('Saved state parse error:', e);
         }
-    } else {
-        manualRefreshRate(false);
     }
+}
+
+function applyInputData(data) {
+    if (data.price !== undefined) els.price.value = data.price;
+    if (data.currency && Object.prototype.hasOwnProperty.call(CURRENCY_SYMBOLS, data.currency)) {
+        els.currency.value = data.currency;
+    }
+    if (data.dueDate) els.dueDate.value = data.dueDate;
+    if (data.tradeDate) els.tradeDate.value = data.tradeDate;
+    if (data.customRate) {
+        els.customRate.value = data.customRate;
+        hasCustomRateOverride = Boolean(data.customRateOverride);
+    }
+    if (data.cycle) {
+        const radio = document.querySelector(`input[name="cycle"][value="${data.cycle}"]`);
+        if (radio) radio.checked = true;
+    }
+    updateCurrencySymbol();
+}
+
+function resetCalculator() {
+    els.price.value = '';
+    els.currency.value = 'USD';
+    const annualRadio = document.querySelector('input[name="cycle"][value="365"]');
+    if (annualRadio) annualRadio.checked = true;
+
+    const today = formatDateISO(new Date());
+    els.tradeDate.value = today;
+    els.dueDate.value = addDaysISO(today, 365);
+
+    hasCustomRateOverride = false;
+    updateCurrencySymbol();
+    localStorage.removeItem(INPUTS_CACHE_KEY);
+
+    if (window.location.search) {
+        window.history.replaceState({}, '', window.location.pathname);
+    }
+
+    initRates({ preserveCustomRate: false });
+    calculate();
+    showToast('已重置');
+}
+
+function getCachedRatesTable() {
+    const raw = getStorageWithTTL(RATES_CACHE_KEY);
+    if (!raw) return null;
+    try {
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed.rates === 'object') {
+            return parsed.rates;
+        }
+    } catch (e) {
+        localStorage.removeItem(RATES_CACHE_KEY);
+    }
+    return null;
+}
+
+async function initRates({ preserveCustomRate = false } = {}) {
+    const base = els.currency.value;
+    if (base === 'CNY') {
+        finishRateUpdate(1, '1.0000', { preserveCustomRate: false });
+        return;
+    }
+
+    const cachedRates = getCachedRatesTable();
+    if (cachedRates && cachedRates[base] > 0) {
+        const rate = cachedRates[base];
+        finishRateUpdate(rate, rate.toFixed(4), { preserveCustomRate });
+        return;
+    }
+
+    await fetchExchangeRates({ preserveCustomRate });
 }
 
 async function manualRefreshRate(isUserClick = true) {
     const base = els.currency.value;
     if (base === 'CNY') return;
 
-    const limitKey = "vps_refresh_limit";
-    const rawLimit = getCookie(limitKey);
-    let limitData = { count: 0, resetTime: Date.now() + 12*3600*1000 };
+    const rawLimit = getStorageWithTTL(REFRESH_LIMIT_KEY);
+    let limitData = { count: 0, resetTime: Date.now() + 12 * 3600 * 1000 };
 
     if (rawLimit) {
         try {
             const parsed = JSON.parse(rawLimit);
             if (parsed.resetTime && Date.now() < parsed.resetTime) {
                 limitData = parsed;
-            } else {
-                limitData = { count: 0, resetTime: Date.now() + 12*3600*1000 };
             }
-        } catch(e) {}
+        } catch (e) {
+            // ignore corrupted limit cache
+        }
     }
 
     if (isUserClick) {
-        if (limitData.count >= 2) {
+        if (limitData.count >= 5) {
             showRateLimitTip();
             return;
         }
-        limitData.count++;
-        const hoursLeft = (limitData.resetTime - Date.now()) / (1000*3600);
-        setCookie(limitKey, JSON.stringify(limitData), Math.max(0.1, hoursLeft));
+        limitData.count += 1;
+        const hoursLeft = (limitData.resetTime - Date.now()) / (1000 * 3600);
+        setStorageWithTTL(REFRESH_LIMIT_KEY, JSON.stringify(limitData), Math.max(0.1, hoursLeft));
     }
 
-    await fetchExchangeRate();
+    hasCustomRateOverride = false;
+    await fetchExchangeRates({ preserveCustomRate: false, showSuccessToast: isUserClick });
 }
 
-async function fetchExchangeRate() {
+async function fetchJsonWithTimeout(url, timeoutMs) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+        const response = await fetch(url, { signal: controller.signal });
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+        }
+        return await response.json();
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+async function fetchExchangeRates({ preserveCustomRate = false, showSuccessToast = false } = {}) {
     const base = els.currency.value;
     els.refreshIcon.classList.add('spin');
-    els.apiRateDisplay.textContent = "...";
+    els.apiRateDisplay.textContent = '...';
 
-    try {
-        const response = await fetch(API_URL);
-        const data = await response.json();
-        
-        if (data.result === "success") {
-            const baseInCNY = data.rates[base];
-            if (baseInCNY) {
-                const rate = 1 / baseInCNY;
-                finishRateUpdate(rate, rate.toFixed(4));
-                
-                const cacheData = JSON.stringify({ rate: rate, time: Date.now() });
-                setCookie(`vps_rate_${base}`, cacheData, 12);
-                saveInputsToCookie();
-            } else {
-                throw new Error("Currency not found");
+    for (const source of RATE_SOURCES) {
+        try {
+            const data = await fetchJsonWithTimeout(source.url, FETCH_TIMEOUT_MS);
+            const table = source.parse(data);
+            if (table && table[base] > 0) {
+                setStorageWithTTL(
+                    RATES_CACHE_KEY,
+                    JSON.stringify({ rates: table, source: source.name, time: Date.now() }),
+                    12
+                );
+                const rate = table[base];
+                finishRateUpdate(rate, rate.toFixed(4), { preserveCustomRate });
+                saveInputs();
+                if (showSuccessToast) {
+                    showToast('汇率已更新');
+                }
+                return;
             }
-        } else {
-            throw new Error("API Error");
+        } catch (error) {
+            console.warn(`Rate source ${source.name} failed:`, error);
         }
-    } catch (error) {
-        console.error(error);
-        els.apiRateDisplay.textContent = "ERR";
-        els.refreshIcon.classList.remove('spin');
-        showToast("获取汇率失败");
     }
+
+    // All remote sources failed: fall back to offline reference rate
+    const fallbackRate = DEFAULT_FALLBACK_RATES[base] || 1;
+    els.refreshIcon.classList.remove('spin');
+    finishRateUpdate(fallbackRate, `离线 ${fallbackRate.toFixed(2)}`, { preserveCustomRate });
+    showToast('实时汇率不可用，已使用参考汇率');
 }
 
-function finishRateUpdate(rate, text) {
-    els.customRate.value = rate.toFixed(4);
+function finishRateUpdate(rate, text, { preserveCustomRate = false } = {}) {
+    if (!preserveCustomRate || !els.customRate.value.trim()) {
+        els.customRate.value = rate.toFixed(4);
+    }
     els.apiRateDisplay.textContent = text;
     els.refreshIcon.classList.remove('spin');
     calculate();
@@ -317,158 +499,166 @@ function hideRateLimitTip() {
     }
 }
 
-window.hideRateLimitTip = hideRateLimitTip;
-
 function showToast(msg) {
     els.toast.textContent = msg;
     els.toast.classList.add('show');
-    setTimeout(() => {
+    if (toastTimer) clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => {
         els.toast.classList.remove('show');
+        toastTimer = null;
     }, 2000);
 }
 
 function initDates() {
-    const now = new Date();
-    els.tradeDate.value = formatDate(now);
-    if (els.dueDate.value) return;
-    const currentYear = now.getFullYear();
-    const thisYearNov25 = new Date(currentYear, 10, 25); 
-    let targetDueDate;
-    if (now.getTime() <= thisYearNov25.getTime()) {
-        targetDueDate = thisYearNov25;
-    } else {
-        targetDueDate = new Date(currentYear + 1, 10, 25);
+    const today = formatDateISO(new Date());
+    if (!els.tradeDate.value) {
+        els.tradeDate.value = today;
     }
-    els.dueDate.value = formatDate(targetDueDate);
-}
-
-function formatDate(date) {
-    const y = date.getFullYear();
-    const m = String(date.getMonth() + 1).padStart(2, '0');
-    const d = String(date.getDate()).padStart(2, '0');
-    return `${y}-${m}-${d}`;
+    if (!els.dueDate.value) {
+        els.dueDate.value = addDaysISO(els.tradeDate.value, 365);
+    }
+    syncDateDisplays();
 }
 
 function updateCurrencySymbol() {
     const code = els.currency.value;
-    els.symbolDisplay.textContent = currencySymbols[code] || code;
+    els.symbolDisplay.textContent = CURRENCY_SYMBOLS[code] || code;
 }
 
 function calculate() {
     syncDateDisplays();
 
-    const price = parseFloat(els.price.value) || 0;
-    const rate = parseFloat(els.customRate.value) || 0;
-    const due = new Date(els.dueDate.value);
-    const trade = new Date(els.tradeDate.value);
-    
-    let cycleDays = 365;
-    for (const radio of els.cycles) {
-        if (radio.checked) { cycleDays = parseInt(radio.value); break; }
+    const { days: cycleDays } = getSelectedCycle();
+    const res = calculateRemainingValue({
+        price: els.price.value,
+        rate: els.customRate.value,
+        cycleDays,
+        dueDate: els.dueDate.value,
+        tradeDate: els.tradeDate.value
+    });
+
+    latestResult = res;
+
+    els.priceCNYPreview.textContent = `≈ ¥${res.totalCNY.toFixed(2)}`;
+    if (!res.validDates) return;
+
+    els.progressBar.style.width = `${res.visualProgress}%`;
+    els.finalValue.textContent = res.remainingCNY.toFixed(2);
+    els.originalCurrencyValue.textContent = `≈ ${res.remainingOrig.toFixed(2)} ${els.currency.value}`;
+    if (els.dailyCostPreview) {
+        els.dailyCostPreview.textContent = `日均 ¥${res.dailyCNY.toFixed(2)} / 天`;
     }
+    els.daysRemaining.textContent = String(res.daysRemaining);
+    els.progressText.textContent = `${res.progress.toFixed(1)}%`;
 
-    const totalCNY = price * rate;
-    els.priceCNYPreview.textContent = `≈${totalCNY.toFixed(2)}元`;
-
-    if (isNaN(due.getTime()) || isNaN(trade.getTime())) return;
-
-    const diffTime = due - trade;
-    const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
-    const dailyPrice = price / cycleDays;
-    
-    let valOrig = 0, valCNY = 0, progress = 0;
-
-    if (diffDays <= 0) {
-        valOrig = 0; valCNY = 0; progress = 0; 
-    } else {
-        valOrig = dailyPrice * diffDays;
-        valCNY = valOrig * rate;
-        let baseDays = cycleDays;
-        if (diffDays > cycleDays) {
-            baseDays = cycleDays * Math.ceil(diffDays / cycleDays);
-        }
-        progress = (diffDays / baseDays) * 100;
+    if (els.expiredBadge) {
+        els.expiredBadge.classList.toggle('hidden', !res.isExpired);
     }
-    
-    let visualProgress = progress;
-    if (visualProgress > 100) visualProgress = 100;
-    if (visualProgress < 0) visualProgress = 0;
-
-    els.progressBar.style.width = `${visualProgress}%`;
-    els.finalValue.textContent = valCNY.toFixed(2);
-    els.originalCurrencyValue.textContent = `≈ ${valOrig.toFixed(2)} ${els.currency.value}`;
-    els.daysRemaining.textContent = diffDays > 0 ? diffDays : "0";
-    els.progressText.textContent = `${progress.toFixed(1)}%`;
 }
 
-function copyResult() {
-    const price = els.price.value || "0";
-    const currency = els.currency.value;
-    const rate = els.customRate.value || "0";
-    const days = els.daysRemaining.textContent;
-    const valCNY = els.finalValue.textContent;
-    const valOrig = els.originalCurrencyValue.textContent.replace('≈', '').trim().split(' ')[0];
-    const tradeDate = els.tradeDate.value;
-    const dueDate = els.dueDate.value;
-    
-    let cycleText = "年付";
-    for (const radio of els.cycles) {
-        if (radio.checked) { 
-            cycleText = radio.parentElement.innerText.trim();
-            break; 
+async function writeTextToClipboard(text) {
+    if (navigator.clipboard && window.isSecureContext) {
+        try {
+            await navigator.clipboard.writeText(text);
+            return true;
+        } catch (e) {
+            // Fall through to legacy textarea copy
         }
     }
 
-    const cnyPrice = (parseFloat(price) * parseFloat(rate)).toFixed(2);
-    const md = `## VPS 剩余价值
-- 交易日期：${tradeDate}
-- 外币汇率：1 ${currency} ≈ ${rate} CNY
-- 续费价格：${price} ${currency}/${cycleText}（约${cnyPrice}元）
-- 剩余天数：${days}天（${dueDate} 到期）
-- 剩余价值：${valCNY}元（约${valOrig} ${currency}）`;
-
-    const textArea = document.createElement("textarea");
-    textArea.value = md;
+    const textArea = document.createElement('textarea');
+    textArea.value = text;
+    textArea.setAttribute('readonly', '');
+    textArea.style.position = 'fixed';
+    textArea.style.opacity = '0';
     document.body.appendChild(textArea);
     textArea.select();
-    document.execCommand("copy");
-    document.body.removeChild(textArea);
-    showToast("已复制到剪贴板");
+    let ok = false;
+    try {
+        ok = document.execCommand('copy');
+    } finally {
+        document.body.removeChild(textArea);
+    }
+    return ok;
 }
 
-const modal = {
-    el: document.getElementById('imageModal'),
-    img: document.getElementById('generatedImage'),
-    loading: document.getElementById('modalLoading'),
-    actions: document.getElementById('modalActions')
-};
+async function copyResult() {
+    if (!latestResult) calculate();
+    const { label: cycleLabel } = getSelectedCycle();
+    const md = buildMarkdownSummary({
+        price: els.price.value,
+        currency: els.currency.value,
+        rate: els.customRate.value,
+        cycleLabel,
+        tradeDate: els.tradeDate.value,
+        dueDate: els.dueDate.value,
+        result: latestResult
+    });
+
+    const copied = await writeTextToClipboard(md);
+    showToast(copied ? '已复制到剪贴板' : '复制失败，请手动复制');
+}
+
+async function copyShareLink() {
+    const query = buildShareQuery({
+        price: els.price.value,
+        currency: els.currency.value,
+        cycle: getSelectedCycle().days,
+        dueDate: els.dueDate.value,
+        tradeDate: els.tradeDate.value,
+        customRate: els.customRate.value
+    });
+    const url = `${window.location.origin}${window.location.pathname}${query ? `?${query}` : ''}`;
+    const copied = await writeTextToClipboard(url);
+    showToast(copied ? '已复制分享链接' : '复制链接失败');
+}
 
 function closeImageModal() {
-    modal.el.classList.remove('opacity-100');
+    els.modalEl.classList.remove('opacity-100');
     setTimeout(() => {
-        modal.el.classList.add('hidden');
-        modal.img.classList.add('hidden');
-        modal.actions.classList.add('hidden');
-        modal.loading.classList.remove('hidden');
-        modal.img.src = '';
+        els.modalEl.classList.add('hidden');
+        els.modalImg.classList.add('hidden');
+        els.modalActions.classList.add('hidden');
+        els.modalLoading.classList.remove('hidden');
+        els.modalImg.src = '';
+        latestGeneratedDataUrl = '';
     }, 300);
 }
 
-// Close modal on background click
-modal.el.addEventListener('click', (e) => {
-    if (e.target === modal.el) closeImageModal();
-});
+function downloadGeneratedImage() {
+    if (!latestGeneratedDataUrl) return;
+    const link = document.createElement('a');
+    const dateStamp = (els.tradeDate.value || formatDateISO(new Date())).replace(/-/g, '');
+    link.download = `vps-value-${dateStamp}.png`;
+    link.href = latestGeneratedDataUrl;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    showToast('图片已下载');
+}
+
+async function copyGeneratedImage() {
+    if (!latestGeneratedDataUrl) return;
+    if (!navigator.clipboard || typeof window.ClipboardItem === 'undefined') {
+        showToast('当前环境不支持直接复制图片，请点击下载');
+        return;
+    }
+    try {
+        const res = await fetch(latestGeneratedDataUrl);
+        const blob = await res.blob();
+        await navigator.clipboard.write([new window.ClipboardItem({ [blob.type]: blob })]);
+        showToast('图片已复制到剪贴板');
+    } catch (e) {
+        console.error('Copy image error:', e);
+        showToast('复制图片失败，请点击下载');
+    }
+}
 
 async function generateImage() {
-    console.log('generateImage called');
-    
-    // Show modal immediately to indicate processing
-    modal.el.classList.remove('hidden');
-    // Force reflow
-    void modal.el.offsetWidth;
-    modal.el.classList.add('opacity-100');
-    
-    // Use setTimeout to allow UI to update before heavy lifting
+    els.modalEl.classList.remove('hidden');
+    void els.modalEl.offsetWidth;
+    els.modalEl.classList.add('opacity-100');
+
     setTimeout(async () => {
         const node = document.getElementById('mainCard');
         const isDark = document.documentElement.classList.contains('dark');
@@ -485,30 +675,26 @@ async function generateImage() {
                     return element.id !== 'btnContainer';
                 },
                 style: {
-                    transform: 'scale(1)',
+                    transform: 'scale(1)'
                 }
             });
 
-            console.log('Image generated successfully');
-            modal.loading.classList.add('hidden');
-            modal.img.src = dataUrl;
-            modal.img.classList.remove('hidden');
-            modal.actions.classList.remove('hidden');
+            latestGeneratedDataUrl = dataUrl;
+            els.modalLoading.classList.add('hidden');
+            els.modalImg.src = dataUrl;
+            els.modalImg.classList.remove('hidden');
+            els.modalActions.classList.remove('hidden');
+
+            if (els.copyImgBtn) {
+                const canCopyImg = Boolean(navigator.clipboard && typeof window.ClipboardItem !== 'undefined' && window.isSecureContext);
+                els.copyImgBtn.classList.toggle('hidden', !canCopyImg);
+            }
         } catch (e) {
-            console.error('Synchronous error during image generation:', e);
+            console.error('Image generation failed:', e);
             closeImageModal();
-            showToast('生成出错');
+            showToast('生成图片出错');
         } finally {
             restoreDateInputs();
         }
-    }, 100);
+    }, 80);
 }
-
-// Expose functions to global scope for HTML onclick attributes
-window.copyResult = copyResult;
-window.generateImage = generateImage;
-window.closeImageModal = closeImageModal;
-window.hideRateLimitTip = hideRateLimitTip;
-window.manualRefreshRate = manualRefreshRate;
-window.toggleTheme = toggleTheme;
-

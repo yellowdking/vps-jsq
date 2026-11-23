@@ -1,0 +1,15 @@
+services:
+  vps-jsq:
+    image: bbplin/vps-jsq:latest
+    # 如需本地自行构建，取消下面一行注释并注释上面的 image
+    # build: .
+    container_name: vps-jsq
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/healthz >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
